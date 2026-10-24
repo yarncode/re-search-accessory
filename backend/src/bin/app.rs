@@ -2,21 +2,15 @@
 //! UI bundled inside this executable, and shows it in a native WebView2 window.
 //!
 //! `cargo build --release --bin re-search-accessory-app` produces an .exe that can
-//! be double-clicked (no terminal, no separate server). Ship it together with
-//! `WebView2Loader.dll` (the build script copies both).
+//! be double-clicked (no terminal, no separate server). With the MSVC toolchain
+//! WebView2Loader is linked statically; the GNU toolchain needs the DLL next to it.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::net::TcpListener as StdTcpListener;
 
-use axum::{
-    Router,
-    body::Body,
-    http::{HeaderValue, StatusCode, Uri, header},
-    response::{IntoResponse, Response},
-};
-use re_search_accessory_backend::{routes, server};
-use rust_embed::RustEmbed;
+use axum::Router;
+use re_search_accessory_backend::{assets::embedded, routes, server};
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -28,11 +22,6 @@ use wry::{NewWindowResponse, Rect, WebViewBuilder, dpi as wry_dpi};
 const WINDOW_WIDTH: f64 = 1440.0;
 const WINDOW_HEIGHT: f64 = 900.0;
 
-/// The built frontend is compiled into the executable, so the app needs no asset folder.
-#[derive(RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/../web/dist"]
-struct Assets;
-
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
     // Release builds have no console: leave a breadcrumb next to the executable.
@@ -42,41 +31,6 @@ fn fail(message: &str) -> ! {
         }
     }
     std::process::exit(1);
-}
-
-fn asset(path: &str) -> Response {    let clean = path.trim_start_matches('/');
-    let clean = if clean.is_empty() { "index.html" } else { clean };
-
-    let (name, data) = match Assets::get(clean) {
-        Some(file) => (clean, file.data.into_owned()),
-        // SPA fallback: unknown paths render the app shell.
-        None => match Assets::get("index.html") {
-            Some(file) => ("index.html", file.data.into_owned()),
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    "UI chưa được build vào app (chạy build-app.cmd)",
-                )
-                    .into_response();
-            }
-        },
-    };
-
-    let mime = mime_guess::from_path(name).first_or_octet_stream();
-
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_str(mime.as_ref())
-                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-        )],
-        Body::from(data),
-    )
-        .into_response()
-}
-
-async fn embedded(uri: Uri) -> Response {
-    asset(uri.path())
 }
 
 /// The webview is a child window, so its bounds must be set explicitly. Before

@@ -2,8 +2,8 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     Router,
-    http::{HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    http::{HeaderValue, header},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use tokio::net::TcpListener;
@@ -19,18 +19,6 @@ use crate::{
     db::Db,
     routes::{self, AppState},
 };
-
-const HINT: &str = r#"<!doctype html>
-<html lang="vi"><meta charset="utf-8"><title>re-search-accessory</title>
-<body style="font-family:system-ui;max-width:640px;margin:64px auto;line-height:1.6">
-<h1>re-search-accessory</h1>
-<p>Backend đang chạy, nhưng chưa thấy bản build của UI.</p>
-<ol>
-  <li><code>cd web &amp;&amp; npm install &amp;&amp; npm run build</code></li>
-  <li>mở lại <code>/</code>, hoặc chạy <code>npm run dev</code> ở cổng 5173</li>
-</ol>
-<p>Kiểm tra API: <a href="/api/health">/api/health</a></p>
-</body></html>"#;
 
 pub fn state() -> AppState {
     let db = match Db::open() {
@@ -118,8 +106,8 @@ pub fn router() -> Router {
             app.fallback_service(ServeDir::new(&dir).not_found_service(ServeFile::new(index)))
         }
         None => {
-            tracing::warn!("web/dist not found - API only (build the frontend to serve the UI)");
-            app.fallback(|| async { (StatusCode::OK, Html(HINT)) })
+            tracing::info!("web/dist not found - serving the UI embedded in this binary");
+            app.fallback(crate::assets::embedded)
         }
     };
 
