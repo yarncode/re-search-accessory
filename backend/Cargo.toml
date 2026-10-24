@@ -1,0 +1,41 @@
+[package]
+name = "re-search-accessory-backend"
+version = "1.0.0"
+edition = "2024"
+autobins = false
+
+[lib]
+name = "re_search_accessory_backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "re-search-accessory-backend"
+path = "src/main.rs"
+
+[[bin]]
+name = "re-search-accessory-app"
+path = "src/bin/app.rs"
+
+[dependencies]
+axum = "0.8.9"
+base64 = "0.23.1"
+mime_guess = "2.0.5"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "gzip", "charset", "query"] }
+rfd = "0.15.4"
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+rust-embed = { version = "8.13.0", features = ["interpolate-folder-path"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tao = "0.37.2"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tower-http = { version = "0.7.1", features = ["cors", "fs", "trace", "compression-gzip"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+urlencoding = "2.1.3"
+wry = "0.57.1"
+
+[build-dependencies]
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.23"

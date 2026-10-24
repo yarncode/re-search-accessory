@@ -1,0 +1,26 @@
+re-search-accessory — tra cứu linh kiện thegioiic.com & quản lý BOM
+====================================================================
+
+WINDOWS
+  1. Giải nén cả thư mục này (đừng chạy exe từ trong file .zip).
+  2. Chạy re-search-accessory.exe.
+  3. Nếu Windows báo thiếu WebView2: cài "Microsoft Edge WebView2 Runtime"
+     (Windows 10/11 thường đã có sẵn) rồi chạy lại.
+  Không cần cài Rust/Node, không cần mở cổng nào.
+
+LINUX
+  1. Cài thư viện hệ thống (Ubuntu/Debian 24.04+):
+       sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0
+  2. Giải nén và chạy:
+       tar -xzf re-search-accessory-*-linux-x64.tar.gz
+       ./re-search-accessory
+  3. Bản server không giao diện (tuỳ chọn): ./re-search-accessory-server
+     rồi mở http://127.0.0.1:8787
+
+DỮ LIỆU
+  Windows: %LOCALAPPDATA%\re-search-accessory\app.db
+  Linux:   ~/.local/share/re-search-accessory/app.db
+  (đổi bằng biến môi trường RES_DATA_DIR)
+
+Ứng dụng chỉ đọc dữ liệu công khai của thegioiic.com, không phải ứng dụng
+chính thức của trang. Dự án mã nguồn mở theo giấy phép MIT.

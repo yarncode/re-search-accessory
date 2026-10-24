@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description"
+    content="Tra cứu linh kiện điện tử trên thegioiic.com: tìm theo tên, mã part, lọc theo hãng và thông số." />
+  <title>re-search-accessory — tra cứu linh kiện</title>
+  <link rel="stylesheet" type="text/css" href="/loader.css" />
+</head>
+
+<body>
+  <div id="app">
+    <div id="loading-bg">
+      <div class="loading-logo">
+        <!-- Chip mark -->
+        <svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+          <rect x="18" y="18" width="28" height="28" rx="6" fill="none" stroke="var(--initial-loader-color)"
+            stroke-width="3" />
+          <g stroke="var(--initial-loader-color)" stroke-width="3" stroke-linecap="round">
+            <path d="M26 18V11" /><path d="M32 18V11" /><path d="M38 18V11" />
+            <path d="M26 53v-7" /><path d="M32 53v-7" /><path d="M38 53v-7" />
+            <path d="M18 26h-7" /><path d="M18 32h-7" /><path d="M18 38h-7" />
+            <path d="M53 26h-7" /><path d="M53 32h-7" /><path d="M53 38h-7" />
+          </g>
+        </svg>
+      </div>
+      <div class="loading">
+        <div class="effect-1 effects"></div>
+        <div class="effect-2 effects"></div>
+        <div class="effect-3 effects"></div>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+  <script>
+    const loaderColor = localStorage.getItem('materio-initial-loader-bg') || '#FFFFFF'
+    const primaryColor = localStorage.getItem('materio-initial-loader-color') || '#8C57FF'
+
+    if (loaderColor)
+      document.documentElement.style.setProperty('--initial-loader-bg', loaderColor)
+
+    if (primaryColor)
+      document.documentElement.style.setProperty('--initial-loader-color', primaryColor)
+  </script>
+</body>
+
+</html>
