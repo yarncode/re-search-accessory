@@ -66,6 +66,10 @@ jobs:
 
       - name: Build desktop app + server
         working-directory: backend
+        shell: bash
+        env:
+          # Static CRT so the Windows download runs without the VC++ redistributable.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release --bin re-search-accessory-app --bin re-search-accessory-backend
 
       - name: Package (Windows)
