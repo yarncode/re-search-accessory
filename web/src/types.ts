@@ -113,6 +113,22 @@ export type JlcStatus = {
   error: string | null
 }
 
+export type ThegioiicStatus = {
+  connected: boolean
+}
+
+export type ThegioiicCartFailure = {
+  product_id: number
+  quantity: number
+  error: string
+}
+
+export type ThegioiicCartResult = {
+  added: number
+  skipped: number
+  failed: ThegioiicCartFailure[]
+}
+
 export type SavedBom = {
   id: string
   name: string

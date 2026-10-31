@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { formatVnd, pickNativePath } from '@/api'
+import { apiGet, apiSend, formatVnd, pickNativePath } from '@/api'
 import { rememberSetting } from '@/settings'
 import ProductDetail from '@/views/accessory/ProductDetail.vue'
 import BomRow from '@/views/bom/BomRow.vue'
 import { useBomStore } from '@/stores/bom'
-import { detectColumns, parseBomFile } from '@/utils/bom'
+import { type BomItem, detectColumns, parseBomFile } from '@/utils/bom'
+import type { ThegioiicCartResult, ThegioiicStatus } from '@/types'
 
 const store = useBomStore()
 
@@ -15,6 +16,22 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const fileError = ref('')
 const dragging = ref(false)
 const filter = ref<'all' | 'ok' | 'review' | 'missing' | 'pending' | 'shortage'>('all')
+const tableSearch = ref('')
+const groupFilter = ref('')
+const selectedIds = ref<string[]>([])
+const groupDialog = ref(false)
+const groupNameDraft = ref('')
+const tgConnected = ref(false)
+const tgLoading = ref(true)
+const pushOpen = ref(false)
+const pushing = ref(false)
+const pushError = ref('')
+const pushResult = ref<ThegioiicCartResult | null>(null)
+const pushScope = ref<{ type: 'bom' } | { type: 'group'; name: string } | null>(null)
+const manualOpen = ref(false)
+const tokenDraft = ref('')
+const connecting = ref(false)
+const connectError = ref('')
 const detailSlug = ref<string | null>(null)
 
 const savedOpen = ref(false)
@@ -118,15 +135,394 @@ const filters = computed(() => [
   { value: 'shortage' as const, label: `Thiếu hàng (${store.counts.shortage})` },
 ])
 
+function normalizeSearch(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036F]/g, '')
+    .toLowerCase()
+    .replace(/đ/g, 'd')
+}
+
+const searchTokens = computed(() =>
+  normalizeSearch(tableSearch.value).split(/\s+/).filter(Boolean))
+
+function searchText(item: BomItem): string {
+  return normalizeSearch([
+    item.ref,
+    item.input,
+    item.footprint,
+    item.note,
+    item.product?.name ?? '',
+    item.product?.manufacturer_code ?? '',
+    item.product?.supplier?.name ?? '',
+    item.group,
+    ...Object.values(item.extra ?? {}),
+  ].join(' '))
+}
+
 const visibleItems = computed(() => {
-  if (filter.value === 'all')
-    return store.items
+  let list = groupFilter.value === ''
+    ? store.items.filter(item => !item.group)
+    : store.items.filter(item => item.group === groupFilter.value)
 
   if (filter.value === 'shortage')
-    return store.items.filter(item => store.shortage(item))
+    list = list.filter(item => store.shortage(item))
+  else if (filter.value !== 'all')
+    list = list.filter(item => item.status === filter.value)
 
-  return store.items.filter(item => item.status === filter.value)
+  const tokens = searchTokens.value
+
+  if (!tokens.length)
+    return list
+
+  return list.filter(item => {
+    const haystack = searchText(item)
+
+    return tokens.every(token => haystack.includes(token))
+  })
 })
+
+const selectedSet = computed(() => new Set(selectedIds.value))
+const selectedItems = computed(() => store.items.filter(item => selectedSet.value.has(item.id)))
+const visibleIds = computed(() => visibleItems.value.map(item => item.id))
+
+const allVisibleSelected = computed(() =>
+  visibleIds.value.length > 0 && visibleIds.value.every(id => selectedSet.value.has(id)))
+
+const someVisibleSelected = computed(() =>
+  visibleIds.value.some(id => selectedSet.value.has(id)))
+
+const activeGroup = computed(() =>
+  groupFilter.value ? store.groups.find(group => group.name === groupFilter.value) ?? null : null)
+
+const groupedCount = computed(() => store.counts.total - store.ungroupedCount)
+
+function itemsCost(list: BomItem[]): number {
+  return list.reduce((sum, item) =>
+    sum + (item.product ? item.product.price * store.orderQty(item) : 0), 0)
+}
+
+const ungroupedCost = computed(() => itemsCost(store.items.filter(item => !item.group)))
+const selectedCost = computed(() => itemsCost(selectedItems.value))
+
+const pushItems = computed(() => {
+  const scope = pushScope.value
+
+  if (!scope)
+    return []
+
+  return scope.type === 'bom'
+    ? store.items.filter(item => !item.group)
+    : store.items.filter(item => item.group === scope.name)
+})
+
+const pushMatchedItems = computed(() => pushItems.value.filter(item => item.product))
+const pushSkippedCount = computed(() => pushItems.value.length - pushMatchedItems.value.length)
+const pushTotal = computed(() => itemsCost(pushMatchedItems.value))
+
+const pushScopeLabel = computed(() => {
+  const scope = pushScope.value
+
+  if (!scope)
+    return ''
+
+  return scope.type === 'bom' ? 'BOM tổng' : scope.name
+})
+
+const hasActiveFilters = computed(() =>
+  groupFilter.value !== '' || filter.value !== 'all' || Boolean(tableSearch.value))
+
+function clearFilters() {
+  groupFilter.value = ''
+  filter.value = 'all'
+  tableSearch.value = ''
+}
+
+watch(() => store.items.map(item => item.id).join('|'), () => {
+  const existing = new Set(store.items.map(item => item.id))
+  const next = selectedIds.value.filter(id => existing.has(id))
+
+  if (next.length !== selectedIds.value.length)
+    selectedIds.value = next
+})
+
+watch(() => store.groups.map(group => group.name).join('|'), () => {
+  if (groupFilter.value && !store.groups.some(group => group.name === groupFilter.value))
+    groupFilter.value = ''
+})
+
+function toggleSelect(id: string) {
+  selectedIds.value = selectedSet.value.has(id)
+    ? selectedIds.value.filter(value => value !== id)
+    : [...selectedIds.value, id]
+}
+
+function toggleSelectVisible() {
+  const visible = new Set(visibleIds.value)
+
+  if (allVisibleSelected.value) {
+    selectedIds.value = selectedIds.value.filter(id => !visible.has(id))
+
+    return
+  }
+
+  selectedIds.value = [...new Set([...selectedIds.value, ...visibleIds.value])]
+}
+
+function clearSelection() {
+  selectedIds.value = []
+}
+
+function openGroupDialog() {
+  if (!selectedItems.value.length)
+    return
+
+  groupNameDraft.value = ''
+  groupDialog.value = true
+}
+
+function assignSelectedToGroup(name: string) {
+  const count = store.setGroup(selectedItems.value.map(item => item.id), name)
+
+  groupDialog.value = false
+
+  if (!count) {
+    notify(name ? 'Các dòng đã nằm trong nhóm này' : 'Các dòng đang chưa có nhóm')
+
+    return
+  }
+
+  selectedIds.value = []
+
+  if (name) {
+    tableSearch.value = ''
+    filter.value = 'all'
+    groupFilter.value = ''
+
+    notify(store.ungroupedCount > 0
+      ? `Đã gán ${count} dòng vào nhóm “${name}”. Đã ẩn khỏi BOM tổng, còn ${store.ungroupedCount} dòng chưa nhóm.`
+      : `Đã gán ${count} dòng vào nhóm “${name}”. Tất cả linh kiện đã được gán nhóm.`)
+  }
+  else {
+    groupFilter.value = ''
+
+    notify(`Đã bỏ nhóm ${count} dòng, đã trả về BOM tổng`)
+  }
+}
+
+function createGroupAndAssign() {
+  const name = groupNameDraft.value.trim()
+
+  if (name)
+    assignSelectedToGroup(name)
+}
+
+function markActiveGroupOrdered() {
+  const group = activeGroup.value
+
+  if (!group)
+    return
+
+  const count = store.markGroupOrdered(group.name)
+
+  notify(count
+    ? `Đã đánh dấu đặt ${count} dòng trong nhóm “${group.name}”`
+    : 'Không còn dòng nào ở trạng thái “Cần mua”')
+}
+
+function exportGroupCsv() {
+  const group = activeGroup.value
+
+  if (!group)
+    return
+
+  store.exportCsv(group.name)
+  notify(`Đã xuất CSV nhóm “${group.name}”`)
+}
+
+function clearActiveGroup() {
+  const group = activeGroup.value
+
+  if (!group)
+    return
+
+  const count = store.clearGroup(group.name)
+
+  groupFilter.value = ''
+  notify(`Đã bỏ nhóm ${count} dòng khỏi “${group.name}”, đã trả về BOM tổng`)
+}
+
+/* ---------------- thegioiic cart bridge ---------------- */
+async function loadThegioiicStatus() {
+  tgLoading.value = true
+
+  try {
+    const status = await apiGet<ThegioiicStatus>('/thegioiic/status')
+
+    tgConnected.value = status.connected
+  }
+  catch {
+    tgConnected.value = false
+  }
+  finally {
+    tgLoading.value = false
+  }
+}
+
+function connectThegioiic() {
+  const callback = encodeURIComponent('https://www.thegioiic.com/auth/google/callback')
+
+  try {
+    if (pushOpen.value && pushScope.value)
+      sessionStorage.setItem('res-push-scope', JSON.stringify(pushScope.value))
+  }
+  catch {
+    // sessionStorage can be unavailable in hardened environments
+  }
+
+  window.location.href = `https://api.thegioiic.com/v1/auth/google/login?redirect_uri=${callback}`
+}
+
+function openManualConnect() {
+  tokenDraft.value = ''
+  connectError.value = ''
+  manualOpen.value = true
+}
+
+async function connectWithToken() {
+  const token = tokenDraft.value.trim()
+
+  if (!token || connecting.value)
+    return
+
+  connecting.value = true
+  connectError.value = ''
+
+  try {
+    await apiSend('POST', '/thegioiic/connect', { token })
+    tgConnected.value = true
+    manualOpen.value = false
+    notify('Đã kết nối tài khoản thegioiic')
+  }
+  catch (err) {
+    connectError.value = (err as Error).message
+  }
+  finally {
+    connecting.value = false
+  }
+}
+
+async function disconnectThegioiic() {
+  try {
+    await apiSend('DELETE', '/thegioiic/connect')
+    tgConnected.value = false
+    notify('Đã ngắt kết nối thegioiic')
+  }
+  catch (err) {
+    notify((err as Error).message)
+  }
+}
+
+function handleThegioiicReturn() {
+  const url = new URL(window.location.href)
+  const state = url.searchParams.get('thegioiic')
+
+  if (!state)
+    return
+
+  url.searchParams.delete('thegioiic')
+  window.history.replaceState({}, '', `${url.pathname}${url.search}`)
+
+  if (state === 'connected') {
+    tgConnected.value = true
+    notify('Đã kết nối tài khoản thegioiic')
+
+    try {
+      const saved = sessionStorage.getItem('res-push-scope')
+
+      if (saved) {
+        sessionStorage.removeItem('res-push-scope')
+        pushScope.value = JSON.parse(saved) as { type: 'bom' } | { type: 'group'; name: string }
+        pushResult.value = null
+        pushError.value = ''
+        pushOpen.value = true
+      }
+    }
+    catch {
+      // ignore malformed saved state
+    }
+  }
+  else if (state === 'error') {
+    tgConnected.value = false
+    sessionStorage.removeItem('res-push-scope')
+    notify('Kết nối thegioiic thất bại. Hãy thử lại.')
+  }
+  else {
+    sessionStorage.removeItem('res-push-scope')
+    notify('Đã quay lại app')
+  }
+}
+
+function openPush(scope: { type: 'bom' } | { type: 'group'; name: string }) {
+  pushScope.value = scope
+  pushResult.value = null
+  pushError.value = ''
+  pushOpen.value = true
+}
+
+async function pushToThegioiic() {
+  if (!pushMatchedItems.value.length || pushing.value)
+    return
+
+  pushing.value = true
+  pushError.value = ''
+  pushResult.value = null
+
+  try {
+    const result = await apiSend<ThegioiicCartResult>('POST', '/thegioiic/cart', {
+      items: pushMatchedItems.value.map(item => ({
+        product_id: item.product?.id ?? 0,
+        quantity: store.orderQty(item),
+      })),
+    })
+
+    pushResult.value = result
+
+    if (result.failed.length) {
+      if (result.failed.some(item => /hết hạn|đăng nhập|401/i.test(item.error)))
+        tgConnected.value = false
+
+      notify(`Đã thêm ${result.added}/${pushMatchedItems.value.length} dòng vào giỏ thegioiic`)
+    }
+    else {
+      notify(`Đã thêm ${result.added} dòng vào giỏ thegioiic`)
+    }
+  }
+  catch (err) {
+    if ((err as { status?: number }).status === 401)
+      tgConnected.value = false
+
+    pushError.value = (err as Error).message
+  }
+  finally {
+    pushing.value = false
+  }
+}
+
+function openThegioiicCart() {
+  window.location.href = 'https://www.thegioiic.com/gio-hang?res_cart=1'
+}
+
+function removeRow(id: string) {
+  selectedIds.value = selectedIds.value.filter(value => value !== id)
+  store.removeItem(id)
+}
+
+function resetBom() {
+  selectedIds.value = []
+  groupFilter.value = ''
+  store.reset()
+}
 
 const progress = computed(() =>
   (store.counts.total ? Math.round((store.done / store.counts.total) * 100) : 0))
@@ -313,6 +709,8 @@ function onKey(event: KeyboardEvent) {
 
 onMounted(() => {
   void store.init()
+  loadThegioiicStatus()
+  handleThegioiicReturn()
   window.addEventListener('keydown', onKey)
 })
 
@@ -327,7 +725,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
           Phân tích BOM
         </h1>
         <div class="text-body-2 text-medium-emphasis">
-          Import từ KiCad / CSV / Excel, tự tìm linh kiện, tính theo số bo, đánh dấu mua hàng và lưu lại.
+          Import từ KiCad / CSV / Excel, tự tìm linh kiện, tính theo số bo, chia nhóm mua trước và lưu lại.
         </div>
       </div>
     </div>
@@ -389,7 +787,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         v-if="store.items.length"
         variant="text"
         color="error"
-        @click="store.reset()"
+        @click="resetBom"
       >
         Xoá
       </VBtn>
@@ -491,7 +889,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
               {{ store.currentName || store.fileName }}
             </div>
             <div class="text-caption text-medium-emphasis">
-              {{ store.counts.total }} dòng · tìm theo cột “{{ store.columns.search }}” ·
+              {{ store.counts.total }} dòng · còn {{ store.ungroupedCount }} chưa nhóm · tìm theo cột “{{ store.columns.search }}” ·
               {{ draftLabel }} · {{ jlcLabel }}
             </div>
           </div>
@@ -690,6 +1088,18 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
           </div>
         </VCard>
         <VCard
+          v-if="groupedCount"
+          class="pa-4"
+          elevation="0"
+        >
+          <div class="text-caption text-medium-emphasis">
+            Đã gán nhóm
+          </div>
+          <div class="text-h6 font-weight-bold text-primary">
+            {{ groupedCount }}
+          </div>
+        </VCard>
+        <VCard
           class="pa-4"
           elevation="0"
         >
@@ -738,7 +1148,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
           elevation="0"
         >
           <div class="text-caption text-medium-emphasis">
-            Tạm tính ({{ store.boards }} bo)
+            Tạm tính toàn BOM ({{ store.boards }} bo)
           </div>
           <div class="text-h6 font-weight-bold text-primary">
             {{ formatVnd(store.totalCost) }}
@@ -761,8 +1171,205 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         </VCard>
       </div>
 
-      <!-- 👉 Lọc trạng thái -->
-      <div class="d-flex flex-wrap ga-2 mb-3">
+      <!-- 👉 Nhóm mua -->
+      <div class="d-flex flex-wrap align-center ga-2 mb-3">
+        <VIcon
+          icon="ri-group-line"
+          size="18"
+          class="text-medium-emphasis"
+        />
+        <span class="text-caption text-medium-emphasis">Nhóm mua</span>
+        <VChip
+          :color="groupFilter === '' ? 'primary' : undefined"
+          :variant="groupFilter === '' ? 'flat' : 'tonal'"
+          title="Chỉ hiện các linh kiện chưa gán nhóm"
+          @click="groupFilter = ''"
+        >
+          BOM tổng ({{ store.ungroupedCount }})
+        </VChip>
+        <VChip
+          v-for="group in store.groups"
+          :key="group.name"
+          :color="groupFilter === group.name ? 'primary' : undefined"
+          :variant="groupFilter === group.name ? 'flat' : 'tonal'"
+          @click="groupFilter = group.name"
+        >
+          {{ group.name }} ({{ group.count }})
+        </VChip>
+        <span
+          v-if="!store.groups.length"
+          class="text-caption text-medium-emphasis"
+        >
+          · Chọn các dòng cần mua trước rồi bấm “Gán vào nhóm”.
+        </span>
+        <VSpacer />
+        <VChip
+          v-if="tgConnected"
+          size="small"
+          color="success"
+          variant="tonal"
+          closable
+          :disabled="tgLoading"
+          @click:close="disconnectThegioiic"
+        >
+          <VIcon
+            start
+            icon="ri-links-line"
+            size="14"
+          />
+          thegioiic đã kết nối
+        </VChip>
+        <VBtn
+          v-else
+          size="small"
+          variant="text"
+          prepend-icon="ri-login-circle-line"
+          :loading="tgLoading"
+          @click="connectThegioiic"
+        >
+          Kết nối thegioiic
+        </VBtn>
+      </div>
+
+      <!-- 👉 Thông tin nhóm đang lọc -->
+      <VCard
+        v-if="activeGroup"
+        class="pa-3 mb-3 group-panel"
+        elevation="0"
+      >
+        <div class="d-flex flex-wrap align-center ga-3">
+          <VIcon
+            icon="ri-flag-2-line"
+            color="primary"
+            size="24"
+          />
+          <div>
+            <div class="text-body-1 font-weight-medium">
+              {{ activeGroup.name }}
+            </div>
+            <div class="text-body-2 font-weight-bold text-primary">
+              Tổng tiền nhóm: {{ formatVnd(activeGroup.cost) }}
+            </div>
+            <div class="text-caption text-medium-emphasis">
+              {{ activeGroup.count }} dòng ·
+              Cần mua {{ activeGroup.need }} · Đã đặt {{ activeGroup.ordered }} · Đã nhận {{ activeGroup.received }}
+            </div>
+          </div>
+          <VSpacer />
+          <VBtn
+            size="small"
+            variant="tonal"
+            prepend-icon="ri-shopping-cart-2-line"
+            :disabled="!activeGroup.need"
+            @click="markActiveGroupOrdered"
+          >
+            Đánh dấu đã đặt
+          </VBtn>
+          <VBtn
+            size="small"
+            color="primary"
+            prepend-icon="ri-shopping-cart-2-line"
+            @click="openPush({ type: 'group', name: activeGroup.name })"
+          >
+            Đẩy lên thegioiic
+          </VBtn>
+          <VBtn
+            size="small"
+            variant="text"
+            prepend-icon="ri-shopping-bag-3-line"
+            :disabled="!tgConnected"
+            @click="openThegioiicCart"
+          >
+            Mở giỏ hàng
+          </VBtn>
+          <VBtn
+            size="small"
+            variant="tonal"
+            prepend-icon="ri-download-2-line"
+            @click="exportGroupCsv"
+          >
+            Xuất CSV nhóm
+          </VBtn>
+          <VBtn
+            size="small"
+            variant="text"
+            color="error"
+            @click="clearActiveGroup"
+          >
+            Bỏ nhóm
+          </VBtn>
+        </div>
+      </VCard>
+
+      <!-- 👉 Thông tin BOM tổng -->
+      <VCard
+        v-if="!activeGroup"
+        class="pa-3 mb-3 group-panel"
+        elevation="0"
+      >
+        <div class="d-flex flex-wrap align-center ga-3">
+          <VIcon
+            icon="ri-file-list-3-line"
+            color="primary"
+            size="24"
+          />
+          <div>
+            <div class="text-body-1 font-weight-medium">
+              BOM tổng
+            </div>
+            <div class="text-caption text-medium-emphasis">
+              {{ store.ungroupedCount }} dòng chưa nhóm · {{ groupedCount }} dòng đã gán nhóm
+            </div>
+          </div>
+          <VSpacer />
+          <VBtn
+            size="small"
+            color="primary"
+            prepend-icon="ri-shopping-cart-2-line"
+            :disabled="!store.ungroupedCount"
+            @click="openPush({ type: 'bom' })"
+          >
+            Đẩy lên thegioiic
+          </VBtn>
+          <VBtn
+            size="small"
+            variant="text"
+            prepend-icon="ri-shopping-bag-3-line"
+            :disabled="!tgConnected"
+            @click="openThegioiicCart"
+          >
+            Mở giỏ hàng
+          </VBtn>
+          <div class="text-end">
+            <div class="text-caption text-medium-emphasis">
+              Tổng tiền BOM tổng
+            </div>
+            <div class="text-h6 font-weight-bold text-primary">
+              {{ formatVnd(ungroupedCost) }}
+            </div>
+          </div>
+        </div>
+      </VCard>
+
+      <!-- 👉 Lọc trạng thái + tìm nhanh -->
+      <div class="d-flex flex-wrap align-center ga-2 mb-3">
+        <VTextField
+          v-model="tableSearch"
+          density="compact"
+          variant="outlined"
+          hide-details
+          clearable
+          prepend-inner-icon="ri-search-line"
+          placeholder="Tìm nhanh theo Ref, từ khoá, tên sản phẩm, MPN…"
+          style="inline-size: 360px"
+          @keydown.esc="tableSearch = ''"
+        />
+        <span
+          v-if="tableSearch"
+          class="text-caption text-medium-emphasis"
+        >
+          {{ visibleItems.length }}/{{ store.counts.total }} dòng
+        </span>
         <VChip
           v-for="entry in filters"
           :key="entry.value"
@@ -774,6 +1381,40 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         </VChip>
       </div>
 
+      <!-- 👉 Dòng đang chọn -->
+      <VCard
+        v-if="selectedItems.length"
+        class="pa-2 mb-3 group-select-bar"
+        elevation="0"
+      >
+        <div class="d-flex flex-wrap align-center ga-2 px-2">
+          <VIcon
+            icon="ri-checkbox-multiple-line"
+            color="primary"
+          />
+          <span class="text-body-2">
+            Đã chọn <b>{{ selectedItems.length }}</b> dòng ·
+            Tạm tính <b class="text-primary">{{ formatVnd(selectedCost) }}</b>
+          </span>
+          <VSpacer />
+          <VBtn
+            size="small"
+            color="primary"
+            prepend-icon="ri-play-list-add-line"
+            @click="openGroupDialog"
+          >
+            Gán vào nhóm
+          </VBtn>
+          <VBtn
+            size="small"
+            variant="text"
+            @click="clearSelection"
+          >
+            Bỏ chọn
+          </VBtn>
+        </div>
+      </VCard>
+
       <!-- 👉 Bảng BOM -->
       <div class="bom-table-scroll">
         <VCard
@@ -781,7 +1422,16 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
           elevation="0"
         >
           <div class="bom-head">
-            <span />
+            <div class="bom-select-all">
+              <VCheckbox
+                :model-value="allVisibleSelected"
+                :indeterminate="!allVisibleSelected && someVisibleSelected"
+                density="compact"
+                hide-details
+                aria-label="Chọn tất cả dòng đang hiển thị"
+                @update:model-value="toggleSelectVisible"
+              />
+            </div>
             <span>Ref</span>
             <span>SL</span>
             <span>Cần / đặt</span>
@@ -795,6 +1445,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
             v-for="item in visibleItems"
             :key="item.id"
             :item="item"
+            :selected="selectedSet.has(item.id)"
+            @select="toggleSelect(item.id)"
             @toggle-ok="store.toggleOk(item.id)"
             @pick="(product) => store.pick(item.id, product)"
             @open="(slug) => (detailSlug = slug)"
@@ -805,13 +1457,32 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
             @ordered-at="(value) => store.setOrderedAt(item.id, value)"
             @supplier="(value) => store.setSupplier(item.id, value)"
             @optimize="optimizeOne(item.id)"
+            @remove="removeRow(item.id)"
           />
 
           <div
             v-if="!visibleItems.length"
             class="pa-8 text-center text-medium-emphasis text-body-2"
           >
-            Không có dòng nào ở trạng thái này.
+            <div>
+              {{ tableSearch
+                ? 'Không có dòng nào khớp từ khoá tìm kiếm.'
+                : groupFilter === ''
+                  ? filter !== 'all'
+                    ? 'BOM tổng không có dòng nào ở trạng thái này.'
+                    : 'Tất cả linh kiện đã được gán nhóm.'
+                  : 'Nhóm này không có dòng nào khớp bộ lọc trạng thái hiện tại.' }}
+            </div>
+            <VBtn
+              v-if="hasActiveFilters"
+              class="mt-3"
+              size="small"
+              variant="tonal"
+              prepend-icon="ri-filter-off-line"
+              @click="clearFilters"
+            >
+              Xoá bộ lọc
+            </VBtn>
           </div>
         </VCard>
       </div>
@@ -917,6 +1588,327 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
       </VCard>
     </VDialog>
 
+    <!-- 👉 Gán nhóm mua -->
+    <VDialog
+      v-model="groupDialog"
+      max-width="540"
+    >
+      <VCard class="pa-2">
+        <div class="d-flex align-center pa-2">
+          <span class="text-h6">Gán vào nhóm mua</span>
+          <VSpacer />
+          <IconBtn @click="groupDialog = false">
+            <VIcon icon="ri-close-line" />
+          </IconBtn>
+        </div>
+
+        <div class="pa-3">
+          <div class="text-caption text-medium-emphasis mb-2">
+            Đang chọn <b>{{ selectedItems.length }}</b> dòng. Tạo nhóm để ưu tiên mua trước
+            hoặc thêm vào nhóm đã có.
+          </div>
+
+          <VTextField
+            v-model="groupNameDraft"
+            label="Tên nhóm mới"
+            placeholder="VD: Đợt 1 – mua trước"
+            variant="outlined"
+            density="comfortable"
+            hide-details
+            autofocus
+            @keydown.enter="createGroupAndAssign"
+          />
+
+          <div
+            v-if="store.groups.length"
+            class="mt-4"
+          >
+            <div class="text-caption text-medium-emphasis mb-1">
+              Hoặc thêm vào nhóm đã có
+            </div>
+            <div class="d-flex flex-wrap ga-2">
+              <VChip
+                v-for="group in store.groups"
+                :key="group.name"
+                variant="tonal"
+                @click="assignSelectedToGroup(group.name)"
+              >
+                {{ group.name }} ({{ group.count }})
+              </VChip>
+            </div>
+          </div>
+
+          <div class="d-flex flex-wrap align-center ga-2 mt-5">
+            <VBtn
+              variant="text"
+              color="error"
+              :disabled="!selectedItems.length"
+              @click="assignSelectedToGroup('')"
+            >
+              Bỏ nhóm
+            </VBtn>
+            <VSpacer />
+            <VBtn
+              variant="text"
+              @click="groupDialog = false"
+            >
+              Huỷ
+            </VBtn>
+            <VBtn
+              color="primary"
+              :disabled="!groupNameDraft.trim()"
+              @click="createGroupAndAssign"
+            >
+              Tạo nhóm & gán
+            </VBtn>
+          </div>
+        </div>
+      </VCard>
+    </VDialog>
+
+    <!-- 👉 Đẩy lên thegioiic -->
+    <VDialog
+      v-model="pushOpen"
+      max-width="720"
+      scrollable
+    >
+      <VCard class="pa-2">
+        <div class="d-flex align-center pa-2">
+          <span class="text-h6">Đẩy lên thegioiic</span>
+          <VSpacer />
+          <IconBtn @click="pushOpen = false">
+            <VIcon icon="ri-close-line" />
+          </IconBtn>
+        </div>
+
+        <div class="pa-3">
+          <div class="d-flex flex-wrap align-center ga-3">
+            <div>
+              <div class="text-body-1 font-weight-medium">
+                {{ pushScopeLabel }}
+              </div>
+              <div class="text-caption text-medium-emphasis">
+                {{ pushMatchedItems.length }}/{{ pushItems.length }} dòng khớp sản phẩm ·
+                Tạm tính {{ formatVnd(pushTotal) }}
+              </div>
+            </div>
+            <VSpacer />
+            <VChip
+              v-if="tgConnected"
+              size="small"
+              color="success"
+              variant="tonal"
+            >
+              thegioiic đã kết nối
+            </VChip>
+            <VBtn
+              v-else
+              size="small"
+              color="primary"
+              prepend-icon="ri-login-circle-line"
+              @click="connectThegioiic"
+            >
+              Đăng nhập thegioiic
+            </VBtn>
+          </div>
+
+          <VAlert
+            v-if="!tgConnected"
+            type="info"
+            variant="tonal"
+            density="compact"
+            class="mt-3 text-caption"
+          >
+            App mở trang đăng nhập chính thức của thegioiic để bạn đăng nhập Google.
+            App không lưu mật khẩu Google, chỉ giữ phiên đăng nhập trên máy này để thêm
+            linh kiện vào giỏ hàng của bạn.
+            <div class="mt-2">
+              <VBtn
+                size="x-small"
+                variant="text"
+                @click="openManualConnect"
+              >
+                Kết nối thủ công
+              </VBtn>
+            </div>
+          </VAlert>
+
+          <VAlert
+            v-if="pushError"
+            type="error"
+            variant="tonal"
+            density="compact"
+            class="mt-3 text-caption"
+          >
+            {{ pushError }}
+            <VBtn
+              v-if="!tgConnected"
+              size="x-small"
+              variant="text"
+              class="ms-2"
+              @click="connectThegioiic"
+            >
+              Kết nối lại
+            </VBtn>
+          </VAlert>
+
+          <VAlert
+            v-if="pushResult"
+            :type="pushResult.failed.length ? 'warning' : 'success'"
+            variant="tonal"
+            density="compact"
+            class="mt-3 text-caption"
+          >
+            Đã thêm {{ pushResult.added }} dòng vào giỏ thegioiic.
+            <template v-if="pushSkippedCount">
+              Bỏ qua {{ pushSkippedCount }} dòng chưa khớp sản phẩm.
+            </template>
+            <template v-if="pushResult.failed.length">
+              {{ pushResult.failed.length }} dòng lỗi:
+              <span class="d-block mt-1">
+                {{ pushResult.failed.slice(0, 4).map(item => item.error).join(' · ') }}
+              </span>
+            </template>
+          </VAlert>
+
+          <div
+            v-if="pushMatchedItems.length"
+            class="push-list mt-3"
+          >
+            <div
+              v-for="item in pushMatchedItems"
+              :key="item.id"
+              class="push-row"
+            >
+              <div class="push-row-text">
+                <div class="text-body-2 text-truncate">
+                  {{ item.product?.name }}
+                </div>
+                <div class="text-caption text-medium-emphasis text-truncate">
+                  {{ item.ref }} · SL {{ store.orderQty(item) }} ×
+                  {{ formatVnd(item.product?.price ?? 0) }}
+                </div>
+              </div>
+              <div class="text-body-2 font-weight-medium">
+                {{ formatVnd((item.product?.price ?? 0) * store.orderQty(item)) }}
+              </div>
+            </div>
+          </div>
+
+          <div
+            v-else
+            class="text-caption text-medium-emphasis pa-3 text-center mt-3"
+          >
+            Không có dòng nào đã khớp sản phẩm thegioiic để đẩy lên.
+          </div>
+
+          <div class="text-caption text-medium-emphasis mt-2">
+            Lưu ý: nếu sản phẩm đã có trong giỏ thegioiic, số lượng sẽ được cộng dồn.
+          </div>
+
+          <div class="d-flex flex-wrap align-center ga-2 mt-4">
+            <VBtn
+              v-if="pushResult && pushResult.added"
+              variant="tonal"
+              prepend-icon="ri-external-link-line"
+              @click="openThegioiicCart"
+            >
+              Mở giỏ hàng trong app
+            </VBtn>
+            <VSpacer />
+            <VBtn
+              variant="text"
+              @click="pushOpen = false"
+            >
+              Đóng
+            </VBtn>
+            <VBtn
+              v-if="!pushResult || !pushResult.added"
+              color="primary"
+              prepend-icon="ri-shopping-cart-2-line"
+              :loading="pushing"
+              :disabled="!pushMatchedItems.length || !tgConnected"
+              @click="pushToThegioiic"
+            >
+              Thêm vào giỏ
+            </VBtn>
+          </div>
+        </div>
+      </VCard>
+    </VDialog>
+
+    <!-- 👉 Kết nối thegioiic thủ công -->
+    <VDialog
+      v-model="manualOpen"
+      max-width="560"
+    >
+      <VCard class="pa-2">
+        <div class="d-flex align-center pa-2">
+          <span class="text-h6">Kết nối thegioiic thủ công</span>
+          <VSpacer />
+          <IconBtn @click="manualOpen = false">
+            <VIcon icon="ri-close-line" />
+          </IconBtn>
+        </div>
+
+        <div class="pa-3">
+          <VAlert
+            type="info"
+            variant="tonal"
+            density="compact"
+            class="text-caption"
+          >
+            Nếu đăng nhập Google trong app bị chặn, bạn có thể:
+            <ol class="mt-2 ps-4">
+              <li>Mở thegioiic.com trên trình duyệt và đăng nhập.</li>
+              <li>Nhấn F12 → tab Console → dán lệnh sau rồi Enter:</li>
+            </ol>
+            <code class="d-block my-2">copy(localStorage.getItem('token'))</code>
+            <div>Mã phiên đã được copy. Quay lại app và dán vào ô bên dưới.</div>
+          </VAlert>
+
+          <VTextField
+            v-model="tokenDraft"
+            label="Mã kết nối thegioiic"
+            placeholder="Dán token vừa copy"
+            variant="outlined"
+            density="comfortable"
+            hide-details
+            type="password"
+            class="mt-4"
+            @keydown.enter="connectWithToken"
+          />
+
+          <VAlert
+            v-if="connectError"
+            type="error"
+            variant="tonal"
+            density="compact"
+            class="mt-3 text-caption"
+          >
+            {{ connectError }}
+          </VAlert>
+
+          <div class="d-flex justify-end ga-2 mt-4">
+            <VBtn
+              variant="text"
+              @click="manualOpen = false"
+            >
+              Huỷ
+            </VBtn>
+            <VBtn
+              color="primary"
+              :loading="connecting"
+              :disabled="!tokenDraft.trim()"
+              @click="connectWithToken"
+            >
+              Kết nối
+            </VBtn>
+          </div>
+        </div>
+      </VCard>
+    </VDialog>
+
     <!-- 👉 JLC help -->
     <VDialog
       v-model="jlcHelpOpen"
@@ -1002,13 +1994,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 }
 
 .bom-table {
-  min-inline-size: 1180px;
+  min-inline-size: 1260px;
   border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 
 .bom-head {
   display: grid;
-  grid-template-columns: 38px 58px 88px 86px minmax(0, 0.9fr) minmax(0, 1.5fr) 104px 124px;
+  grid-template-columns: 76px 58px 88px 86px minmax(0, 0.9fr) minmax(0, 1.5fr) 104px 156px;
   gap: 10px;
   padding: 10px 12px;
   font-size: 0.72rem;
@@ -1016,5 +2008,45 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: rgba(var(--v-theme-on-surface), 0.55);
+}
+
+.bom-select-all {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-inline-start: -6px;
+}
+
+.group-panel {
+  border: 1px solid rgba(var(--v-theme-primary), 0.28);
+  background: rgba(var(--v-theme-primary), 0.05);
+}
+
+.group-select-bar {
+  border: 1px solid rgba(var(--v-theme-primary), 0.35);
+  background: rgba(var(--v-theme-primary), 0.07);
+}
+
+.push-list {
+  max-block-size: 300px;
+  overflow-y: auto;
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 8px;
+}
+
+.push-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+}
+
+.push-row + .push-row {
+  border-block-start: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+
+.push-row-text {
+  min-inline-size: 0;
+  flex: 1;
 }
 </style>

@@ -184,6 +184,103 @@ impl Upstream {
     pub fn product_url(&self, slug: &str) -> String {
         format!("{}/{slug}", self.web_base)
     }
+
+    /// Check a thegioiic session token with a read-only account endpoint.
+    pub async fn thegioiic_validate(&self, token: &str) -> Result<(), AppError> {
+        let response = self
+            .http
+            .get(format!("{}/notifications", self.api_base))
+            .query(&[
+                ("page", "1"),
+                ("limit", "1"),
+                ("locale", "vi"),
+            ])
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "*/*")
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            return Err(thegioiic_error(status, &body));
+        }
+
+        Ok(())
+    }
+
+    /// Push a batch of products into the account cart and return the server's
+    /// full cart list. The website's `/carts/store` endpoint is what its own
+    /// client uses after login.
+    pub async fn thegioiic_store_cart(
+        &self,
+        token: &str,
+        items: &[(u64, u64)],
+    ) -> Result<Value, AppError> {
+        let carts = items
+            .iter()
+            .map(|(product_id, quantity)| {
+                serde_json::json!({
+                    "product_id": product_id,
+                    "quantity": quantity,
+                    "category_extra_id": null,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let response = self
+            .http
+            .post(format!("{}/carts/store", self.api_base))
+            .query(&[("locale", "vi")])
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "*/*")
+            .json(&serde_json::json!({ "carts": carts }))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            return Err(thegioiic_error(status, &body));
+        }
+
+        serde_json::from_str::<Value>(&body).map_err(|err| AppError::Upstream {
+            status: 502,
+            message: format!("thegioiic trả dữ liệu giỏ hàng không hợp lệ: {err}"),
+        })
+    }
+}
+
+fn thegioiic_error(status: reqwest::StatusCode, body: &str) -> AppError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return AppError::Upstream {
+            status: status.as_u16(),
+            message: "Phiên đăng nhập thegioiic đã hết hạn hoặc không hợp lệ. Hãy kết nối lại."
+                .to_string(),
+        };
+    }
+
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/message")
+                .or_else(|| value.pointer("/error/message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                "Phiên đăng nhập thegioiic đã hết hạn. Hãy kết nối lại.".to_string()
+            } else {
+                format!("thegioiic từ chối yêu cầu ({status})")
+            }
+        });
+
+    AppError::Upstream {
+        status: status.as_u16(),
+        message,
+    }
 }
 
 fn cache_key(path: &str, params: &[(String, String)]) -> String {

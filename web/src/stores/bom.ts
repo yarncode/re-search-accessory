@@ -39,6 +39,15 @@ export const PURCHASE_LABEL: Record<BomItem['purchase'], string> = {
   received: 'Đã nhận',
 }
 
+export interface BomGroup {
+  name: string
+  count: number
+  need: number
+  ordered: number
+  received: number
+  cost: number
+}
+
 export const useBomStore = defineStore('bom', () => {
   const fileName = ref('')
   const headers = ref<string[]>([])
@@ -113,6 +122,7 @@ export const useBomStore = defineStore('bom', () => {
         purchase: item.purchase ?? 'need',
         orderedAt: item.orderedAt ?? '',
         supplier: item.supplier ?? '',
+        group: item.group ?? '',
       }))
       done.value = 0
     }
@@ -521,6 +531,10 @@ export const useBomStore = defineStore('bom', () => {
         if (!item)
           return
 
+        // A row can be deleted from the table while the analysis is running.
+        if (!find(item.id))
+          continue
+
         try {
           await matchItem(item)
         }
@@ -529,7 +543,8 @@ export const useBomStore = defineStore('bom', () => {
           item.note = (err as Error).message
         }
 
-        done.value += 1
+        if (find(item.id))
+          done.value += 1
       }
     }
 
@@ -587,6 +602,36 @@ export const useBomStore = defineStore('bom', () => {
     item.note = 'Đã sửa từ khoá'
   }
 
+  /** Remove one row from the loaded BOM; also drop it from the raw import so changing the column mapping does not bring it back. */
+  function removeItem(id: string) {
+    const index = items.value.findIndex(item => item.id === id)
+
+    if (index < 0)
+      return
+
+    pushHistory()
+
+    const [removed] = items.value.splice(index, 1)
+    const extra = removed?.extra ?? {}
+
+    let rawIndex = rawRows.value.findIndex(row => row === removed?.extra)
+
+    if (rawIndex < 0) {
+      const keys = Object.keys(extra)
+
+      if (keys.length) {
+        rawIndex = rawRows.value.findIndex(row =>
+          keys.every(key => (row[key] ?? '') === (extra[key] ?? '')))
+      }
+    }
+
+    if (rawIndex >= 0)
+      rawRows.value = rawRows.value.filter((_, rowIndex) => rowIndex !== rawIndex)
+
+    if (removed && removed.status !== 'pending' && done.value > 0)
+      done.value -= 1
+  }
+
   function setPurchase(id: string, purchase: BomItem['purchase']) {
     const item = find(id)
 
@@ -627,6 +672,56 @@ export const useBomStore = defineStore('bom', () => {
 
     pushHistory()
     item.supplier = value
+  }
+
+  /* ---------------- purchase groups ---------------- */
+  function setGroup(ids: string[], group: string): number {
+    const name = group.trim()
+    const wanted = new Set(ids)
+    const targets = items.value.filter(item => wanted.has(item.id) && item.group !== name)
+
+    if (!targets.length)
+      return 0
+
+    pushHistory()
+
+    for (const item of targets)
+      item.group = name
+
+    return targets.length
+  }
+
+  function markGroupOrdered(group: string): number {
+    const today = new Date().toISOString().slice(0, 10)
+    const targets = items.value.filter(item => item.group === group && item.purchase === 'need')
+
+    if (!targets.length)
+      return 0
+
+    pushHistory()
+
+    for (const item of targets) {
+      item.purchase = 'ordered'
+
+      if (!item.orderedAt)
+        item.orderedAt = today
+    }
+
+    return targets.length
+  }
+
+  function clearGroup(group: string): number {
+    const targets = items.value.filter(item => item.group === group)
+
+    if (!targets.length)
+      return 0
+
+    pushHistory()
+
+    for (const item of targets)
+      item.group = ''
+
+    return targets.length
   }
 
   /* ---------------- alternates / optimisation ---------------- */
@@ -823,6 +918,38 @@ export const useBomStore = defineStore('bom', () => {
     items.value.reduce((sum, item) => sum + (item.product ? item.product.price * orderQty(item) : 0), 0),
   )
 
+  const groups = computed<BomGroup[]>(() => {
+    const map = new Map<string, BomGroup>()
+
+    for (const item of items.value) {
+      if (!item.group)
+        continue
+
+      let group = map.get(item.group)
+
+      if (!group) {
+        group = { name: item.group, count: 0, need: 0, ordered: 0, received: 0, cost: 0 }
+        map.set(item.group, group)
+      }
+
+      group.count += 1
+
+      if (item.purchase === 'need')
+        group.need += 1
+      else if (item.purchase === 'ordered')
+        group.ordered += 1
+      else
+        group.received += 1
+
+      if (item.product)
+        group.cost += item.product.price * orderQty(item)
+    }
+
+    return [...map.values()]
+  })
+
+  const ungroupedCount = computed(() => items.value.filter(item => !item.group).length)
+
   const jlcDelta = computed(() => {
     let delta = 0
 
@@ -841,14 +968,21 @@ export const useBomStore = defineStore('bom', () => {
   const jlcCount = computed(() => items.value.filter(item => jlcFor(item)).length)
 
   /* ---------------- export / reset ---------------- */
-  function exportCsv() {
+  function exportCsv(group?: string) {
+    const list = group === undefined
+      ? items.value
+      : items.value.filter(item => item.group === group)
+
+    if (!list.length)
+      return
+
     const header = [
-      'Ref', 'Qty/board', 'Boards', 'Required', 'Order qty', 'Purchase', 'Ordered at', 'Supplier',
+      'Ref', 'Qty/board', 'Boards', 'Required', 'Order qty', 'Group', 'Purchase', 'Ordered at', 'Supplier',
       'Input', 'Footprint', 'Match', 'Matched name', 'MPN', 'Brand', 'Unit price', 'Ext price',
       'Stock', 'Shortage', 'JLC LCSC', 'JLC price USD', 'JLC stock', 'URL',
     ]
 
-    const rows = items.value.map(item => {
+    const rows = list.map(item => {
       const jlc = jlcFor(item)
       const qty = orderQty(item)
 
@@ -858,6 +992,7 @@ export const useBomStore = defineStore('bom', () => {
         boards.value,
         requiredQty(item),
         qty,
+        item.group,
         PURCHASE_LABEL[item.purchase],
         item.orderedAt,
         item.supplier,
@@ -878,7 +1013,12 @@ export const useBomStore = defineStore('bom', () => {
       ]
     })
 
-    downloadCsv(fileName.value || 'bom', header, rows)
+    const base = (fileName.value || 'bom').replace(/\.csv$/i, '')
+    const suffix = group
+      ? `-${group.replace(/[\\/:*?"<>|]+/g, '').replace(/\s+/g, '-')}`
+      : ''
+
+    downloadCsv(`${base}${suffix}`, header, rows)
   }
 
   function reset() {
@@ -920,6 +1060,8 @@ export const useBomStore = defineStore('bom', () => {
     // derived
     counts,
     totalCost,
+    groups,
+    ungroupedCount,
     jlcDelta,
     jlcCount,
     // lifecycle
@@ -948,10 +1090,14 @@ export const useBomStore = defineStore('bom', () => {
     pick,
     setQty,
     setInput,
+    removeItem,
     setPurchase,
     cyclePurchase,
     setOrderedAt,
     setSupplier,
+    setGroup,
+    markGroupOrdered,
+    clearGroup,
     // alternates / optimisation
     loadAlternates,
     optimizeRow,

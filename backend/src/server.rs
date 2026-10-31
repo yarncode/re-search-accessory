@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use axum::{
     Router,
@@ -20,6 +24,19 @@ use crate::{
     routes::{self, AppState},
 };
 
+static CONNECT_SECRET: OnceLock<String> = OnceLock::new();
+
+/// The desktop app generates a per-run secret and injects it into the
+/// thegioiic login page. It prevents any random website from posting a session
+/// token to the loopback API.
+pub fn set_connect_secret(secret: String) {
+    let _ = CONNECT_SECRET.set(secret);
+}
+
+pub fn connect_secret() -> Option<&'static str> {
+    CONNECT_SECRET.get().map(String::as_str)
+}
+
 pub fn state() -> AppState {
     let db = match Db::open() {
         Ok(db) => Arc::new(db),
@@ -33,6 +50,7 @@ pub fn state() -> AppState {
     AppState {
         up: Arc::new(Upstream::new(db.clone())),
         db,
+        cart_cache: Arc::new(std::sync::Mutex::new(None)),
     }
 }
 

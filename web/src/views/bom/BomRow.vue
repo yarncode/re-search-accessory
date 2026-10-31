@@ -16,7 +16,7 @@ const FootprintViewer = defineAsyncComponent({
   delay: 80,
 })
 
-const props = defineProps<{ item: BomItem }>()
+const props = defineProps<{ item: BomItem; selected: boolean }>()
 
 const PURCHASE_OPTIONS = [
   { value: 'need', title: 'Cần mua' },
@@ -25,6 +25,7 @@ const PURCHASE_OPTIONS = [
 ] as const
 
 const emit = defineEmits<{
+  'select': []
   'toggle-ok': []
   'pick': [product: Product]
   'open': [slug: string]
@@ -35,6 +36,7 @@ const emit = defineEmits<{
   'ordered-at': [value: string]
   'supplier': [value: string]
   'optimize': []
+  'remove': []
 }>()
 
 const store = useBomStore()
@@ -204,7 +206,14 @@ function choose(product: Product) {
       class="bom-row"
       :class="`is-${item.status}`"
     >
-      <div class="bom-cell bom-status">
+      <div class="bom-cell bom-select">
+        <VCheckbox
+          :model-value="selected"
+          density="compact"
+          hide-details
+          :aria-label="`Chọn dòng ${item.ref}`"
+          @update:model-value="emit('select')"
+        />
         <VTooltip :text="item.status === 'ok' ? 'Bỏ đánh dấu OK' : 'Đánh dấu đã OK'">
           <template #activator="{ props: tip }">
             <VBtn
@@ -315,6 +324,21 @@ function choose(product: Product) {
         >
           {{ PURCHASE_LABEL[item.purchase] }}
         </VChip>
+        <VChip
+          v-if="item.group"
+          size="x-small"
+          variant="outlined"
+          color="primary"
+          class="bom-group-chip"
+          :title="`Nhóm mua: ${item.group}`"
+        >
+          <VIcon
+            start
+            icon="ri-group-line"
+            size="12"
+          />
+          {{ item.group }}
+        </VChip>
       </div>
 
       <div class="bom-cell bom-actions">
@@ -356,6 +380,24 @@ function choose(product: Product) {
             size="18"
           />
         </VBtn>
+
+        <VTooltip text="Xoá khỏi BOM (Ctrl+Z để hoàn tác)">
+          <template #activator="{ props: tip }">
+            <VBtn
+              v-bind="tip"
+              size="small"
+              icon
+              variant="text"
+              color="error"
+              @click="emit('remove')"
+            >
+              <VIcon
+                icon="ri-delete-bin-6-line"
+                size="18"
+              />
+            </VBtn>
+          </template>
+        </VTooltip>
       </div>
     </div>
 
@@ -550,7 +592,7 @@ function choose(product: Product) {
 <style scoped>
 .bom-row {
   display: grid;
-  grid-template-columns: 38px 58px 88px 86px minmax(0, 0.9fr) minmax(0, 1.5fr) 104px 124px;
+  grid-template-columns: 76px 58px 88px 86px minmax(0, 0.9fr) minmax(0, 1.5fr) 104px 156px;
   gap: 10px;
   align-items: center;
   padding: 8px 12px;
@@ -573,9 +615,12 @@ function choose(product: Product) {
   min-inline-size: 0;
 }
 
-.bom-status {
+.bom-select {
   display: flex;
+  align-items: center;
   justify-content: center;
+  gap: 2px;
+  margin-inline-start: -4px;
 }
 
 .bom-ref {
@@ -640,7 +685,20 @@ function choose(product: Product) {
 
 .bom-purchase {
   display: flex;
-  justify-content: flex-start;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.bom-group-chip {
+  max-inline-size: 100%;
+}
+
+.bom-group-chip :deep(.v-chip__content) {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bom-actions {

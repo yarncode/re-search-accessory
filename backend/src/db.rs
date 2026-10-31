@@ -37,6 +37,11 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS thegioiic_session (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  token TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 "#;
 
 const IMAGE_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1000;
@@ -316,6 +321,41 @@ impl Db {
         )
         .map_err(|err| err.to_string())?;
 
+        Ok(())
+    }
+
+    /* ---------------- thegioiic session ---------------- */
+    /// The thegioiic auth token is kept out of the generic settings table so it
+    /// is never sent back to the UI along with theme/folder preferences.
+    pub fn thegioiic_token(&self) -> Result<Option<String>, String> {
+        let conn = self.conn()?;
+
+        conn.query_row(
+            "SELECT token FROM thegioiic_session WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn set_thegioiic_token(&self, token: &str) -> Result<(), String> {
+        let conn = self.conn()?;
+
+        conn.execute(
+            "INSERT INTO thegioiic_session (id, token, updated_at) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET token = excluded.token, updated_at = excluded.updated_at",
+            params![token, now_ms()],
+        )
+        .map_err(|err| err.to_string())?;
+
+        Ok(())
+    }
+
+    pub fn clear_thegioiic_token(&self) -> Result<(), String> {
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM thegioiic_session WHERE id = 1", [])
+            .map_err(|err| err.to_string())?;
         Ok(())
     }
 

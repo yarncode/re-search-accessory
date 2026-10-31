@@ -16,6 +16,7 @@ export type BomItem = {
   purchase: 'need' | 'ordered' | 'received'
   orderedAt: string
   supplier: string
+  group: string
 }
 
 export type ColumnMap = {
@@ -306,6 +307,7 @@ export function buildItems(
     purchase: 'need',
     orderedAt: '',
     supplier: '',
+    group: '',
   }))
 }
 

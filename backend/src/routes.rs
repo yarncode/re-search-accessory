@@ -1,9 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::{Arc, Mutex}};
 
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{header, HeaderValue},
+    http::{header, HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
@@ -20,6 +20,7 @@ use crate::{
 pub struct AppState {
     pub up: Arc<Upstream>,
     pub db: Arc<Db>,
+    pub cart_cache: Arc<Mutex<Option<Value>>>,
 }
 
 type Q = Query<HashMap<String, String>>;
@@ -41,6 +42,29 @@ fn with_locale(mut params: Vec<(String, String)>) -> Vec<(String, String)> {
     params
 }
 
+/// The injected thegioiic page sends a per-run secret; the local SPA may call
+/// the same bridge from its own loopback origin.
+fn bridge_allowed(headers: &HeaderMap) -> bool {
+    let Some(expected) = crate::server::connect_secret() else {
+        return true;
+    };
+    let received = headers
+        .get("x-res-connect")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if received == expected {
+        return true;
+    }
+
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    origin.starts_with("http://127.0.0.1:") || origin.starts_with("http://localhost:")
+}
+
 pub fn router(state: AppState) -> axum::Router {
     use axum::routing::{get, post};
     axum::Router::new()
@@ -60,6 +84,13 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/bom/docs", get(bom_list).post(bom_save))
         .route("/bom/docs/{id}", get(bom_get).put(bom_update).delete(bom_delete))
         .route("/bom/draft", get(draft_get).put(draft_save))
+        .route("/thegioiic/status", get(thegioiic_status))
+        .route(
+            "/thegioiic/connect",
+            post(thegioiic_connect).delete(thegioiic_disconnect),
+        )
+        .route("/thegioiic/cart", post(thegioiic_cart))
+        .route("/thegioiic/cart-state", get(thegioiic_cart_state))
         .route("/settings", get(settings_get).put(settings_put))
         .route("/pick", post(pick_path))
         .route("/jlcpcb/status", get(jlc_status))
@@ -390,6 +421,149 @@ async fn draft_save(
     let updated_at = st.db.save_draft(&body.payload).map_err(AppError::Store)?;
 
     Ok(Json(json!({ "updated_at": updated_at })))
+}
+
+/* ---------------- thegioiic cart bridge ---------------- */
+
+#[derive(Deserialize)]
+struct ThegioiicConnectBody {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct ThegioiicCartBody {
+    items: Vec<ThegioiicCartItem>,
+}
+
+#[derive(Deserialize)]
+struct ThegioiicCartItem {
+    product_id: u64,
+    quantity: u64,
+}
+
+async fn thegioiic_status(State(st): State<AppState>) -> Result<Json<Value>, AppError> {
+    let token = st.db.thegioiic_token().map_err(AppError::Store)?;
+
+    Ok(Json(json!({ "connected": token.is_some() })))
+}
+
+async fn thegioiic_connect(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ThegioiicConnectBody>,
+) -> Result<Json<Value>, AppError> {
+    if !bridge_allowed(&headers) {
+        return Err(AppError::Upstream {
+            status: 403,
+            message: "Yêu cầu kết nối không hợp lệ.".to_string(),
+        });
+    }
+
+    let token = body.token.trim();
+
+    if token.is_empty() {
+        return Err(AppError::Upstream {
+            status: 400,
+            message: "Thiếu mã phiên thegioiic.".to_string(),
+        });
+    }
+
+    st.up.thegioiic_validate(token).await?;
+    st.db
+        .set_thegioiic_token(token)
+        .map_err(AppError::Store)?;
+
+    Ok(Json(json!({ "connected": true })))
+}
+
+async fn thegioiic_disconnect(State(st): State<AppState>) -> Result<Json<Value>, AppError> {
+    st.db.clear_thegioiic_token().map_err(AppError::Store)?;
+
+    Ok(Json(json!({ "connected": false })))
+}
+
+async fn thegioiic_cart(
+    State(st): State<AppState>,
+    Json(body): Json<ThegioiicCartBody>,
+) -> Result<Json<Value>, AppError> {
+    let token = st
+        .db
+        .thegioiic_token()
+        .map_err(AppError::Store)?
+        .ok_or_else(|| AppError::Upstream {
+            status: 401,
+            message: "Chưa kết nối tài khoản thegioiic. Hãy đăng nhập trước.".to_string(),
+        })?;
+
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+
+    for item in body.items {
+        if item.product_id == 0 || item.quantity == 0 {
+            skipped += 1;
+            continue;
+        }
+
+        items.push((item.product_id, item.quantity));
+    }
+
+    if items.is_empty() {
+        return Ok(Json(json!({
+            "added": 0,
+            "skipped": skipped,
+            "failed": [],
+            "cart_items": [],
+        })));
+    }
+
+    let response = match st.up.thegioiic_store_cart(&token, &items).await {
+        Ok(response) => response,
+        Err(err) => {
+            if matches!(&err, AppError::Upstream { status: 401, .. }) {
+                let _ = st.db.clear_thegioiic_token();
+            }
+
+            return Err(err);
+        }
+    };
+
+    let cart_items = response
+        .pointer("/data/cart_lists")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Ok(mut cache) = st.cart_cache.lock() {
+        *cache = Some(json!({ "items": cart_items.clone() }));
+    }
+
+    Ok(Json(json!({
+        "added": items.len(),
+        "skipped": skipped,
+        "failed": [],
+        "cart_items": cart_items,
+    })))
+}
+
+async fn thegioiic_cart_state(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    if !bridge_allowed(&headers) {
+        return Err(AppError::Upstream {
+            status: 403,
+            message: "Yêu cầu không hợp lệ.".to_string(),
+        });
+    }
+
+    let cached = st
+        .cart_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.clone())
+        .unwrap_or_else(|| json!({ "items": [] }));
+
+    Ok(Json(cached))
 }
 
 /* ---------------- UI settings (theme, last folders) ---------------- */

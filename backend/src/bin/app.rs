@@ -8,6 +8,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::net::TcpListener as StdTcpListener;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use re_search_accessory_backend::{assets::embedded, routes, server};
@@ -89,6 +94,143 @@ fn open_external(target: &str) {
     }
 }
 
+fn make_connect_secret() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    format!("{nanos:x}-{:x}", std::process::id())
+}
+
+/// Runs on thegioiic pages while the user signs in. Once the website stores its
+/// session token, send it to the local backend and return to the BOM page.
+/// The random per-run secret keeps other websites from posting a token to the
+/// loopback API.
+fn thegioiic_login_script(origin: &str, secret: &str) -> String {
+    let template = r#"
+(() => {
+  const LOCAL = '__ORIGIN__';
+  const SECRET = '__SECRET__';
+  const host = location.hostname;
+
+  if (host === 'accounts.google.com') {
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        location.href = LOCAL + '/bom?thegioiic=cancelled';
+      }
+    }, true);
+
+    return;
+  }
+
+  if (host !== 'www.thegioiic.com' && host !== 'thegioiic.com')
+    return;
+
+  const back = reason => {
+    location.href = LOCAL + '/bom?thegioiic=' + reason;
+  };
+
+  const params = new URLSearchParams(location.search);
+
+  // The app opens /gio-hang?res_cart=1 after pushing a BOM. Rebuild the
+  // website's local cart from the server cart so the page shows the items.
+  if (params.get('res_cart') === '1') {
+    fetch(LOCAL + '/api/thegioiic/cart-state', {
+      headers: { 'X-RES-Connect': SECRET },
+      cache: 'no-store',
+    })
+      .then(response => response.ok ? response.json() : null)
+      .then((data) => {
+        if (data && Array.isArray(data.items)) {
+          localStorage.setItem('cart', JSON.stringify(data.items));
+          params.delete('res_cart');
+
+          const query = params.toString();
+
+          location.replace(location.pathname + (query ? '?' + query : ''));
+        }
+      })
+      .catch(() => {});
+
+    return;
+  }
+
+  if (location.pathname.startsWith('/auth/')) {
+    let sent = false;
+    let timer = null;
+
+    const check = async () => {
+      if (sent)
+        return;
+
+      let token = null;
+
+      try {
+        token = localStorage.getItem('token');
+      }
+      catch (e) {
+        return;
+      }
+
+      if (!token)
+        return;
+
+      sent = true;
+
+      if (timer)
+        clearInterval(timer);
+
+      let ok = false;
+
+      try {
+        const response = await fetch(LOCAL + '/api/thegioiic/connect', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-RES-Connect': SECRET,
+          },
+          body: JSON.stringify({ token }),
+        });
+
+        ok = response.ok;
+      }
+      catch (e) {}
+
+      back(ok ? 'connected' : 'error');
+    };
+
+    check();
+    timer = setInterval(check, 700);
+    setTimeout(() => { if (timer) clearInterval(timer); }, 180000);
+  }
+
+  const addBackButton = () => {
+    if (document.getElementById('res-back-app'))
+      return;
+
+    const button = document.createElement('button');
+
+    button.id = 'res-back-app';
+    button.textContent = '← Quay lại app';
+    button.addEventListener('click', () => back('closed'));
+    button.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:10px 14px;border:0;border-radius:8px;background:#7c3aed;color:#fff;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25)';
+    document.body.appendChild(button);
+  };
+
+  if (document.readyState === 'loading')
+    document.addEventListener('DOMContentLoaded', addBackButton);
+  else
+    addBackButton();
+})();
+"#;
+
+    template
+        .replace("__ORIGIN__", origin)
+        .replace("__SECRET__", secret)
+}
+
 fn main() {
     // Bind synchronously so the port is known before the webview opens; the TCP
     // backlog holds the first request until the async runtime starts accepting.
@@ -108,6 +250,11 @@ fn main() {
 
     let url = format!("http://{addr}/");
     let origin = format!("http://{addr}");
+
+    let connect_secret = make_connect_secret();
+    server::set_connect_secret(connect_secret.clone());
+    let login_script = thegioiic_login_script(&origin, &connect_secret);
+    let login_mode = Arc::new(AtomicBool::new(false));
 
     // API + bundled UI in a background tokio runtime.
     std::thread::spawn(move || {
@@ -164,14 +311,42 @@ fn main() {
         Err(err) => fail(&format!("cannot create window: {err}")),
     };
 
-    // The SPA never leaves the local origin; anything else (shop/datasheet
-    // links, target=_blank) belongs in the user's real browser.
+    // The SPA normally never leaves the local origin. During thegioiic sign-in
+    // we allow the official login flow, then the injected script returns to /bom.
     let nav_origin = origin.clone();
+    let nav_login = login_mode.clone();
+    let popup_login = login_mode.clone();
 
     let mut builder = WebViewBuilder::new()
         .with_url(&url)
+        .with_initialization_script(&login_script)
         .with_navigation_handler(move |target| {
             if is_local_url(&target, &nav_origin) {
+                nav_login.store(false, Ordering::Relaxed);
+
+                return true;
+            }
+
+            if target.starts_with("https://api.thegioiic.com/v1/auth/") {
+                nav_login.store(true, Ordering::Relaxed);
+
+                return true;
+            }
+
+            if target.starts_with("https://www.thegioiic.com/gio-hang")
+                || target.starts_with("https://thegioiic.com/gio-hang")
+            {
+                nav_login.store(true, Ordering::Relaxed);
+
+                return true;
+            }
+
+            if nav_login.load(Ordering::Relaxed)
+                && (target.starts_with("https://www.thegioiic.com/")
+                    || target.starts_with("https://thegioiic.com/")
+                    || target.starts_with("https://accounts.google.com/")
+                    || target.starts_with("https://accounts.youtube.com/"))
+            {
                 return true;
             }
 
@@ -179,6 +354,14 @@ fn main() {
             false
         })
         .with_new_window_req_handler(move |target, _features| {
+            if popup_login.load(Ordering::Relaxed)
+                && (target.starts_with("https://accounts.google.com/")
+                    || target.starts_with("https://www.thegioiic.com/")
+                    || target.starts_with("https://thegioiic.com/"))
+            {
+                return NewWindowResponse::Allow;
+            }
+
             open_external(&target);
             NewWindowResponse::Deny
         })
